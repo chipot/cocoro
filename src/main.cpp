@@ -48,6 +48,7 @@ struct awaitable_event
 {
     int fd;
     short what;
+    int timeout;
 };
 
 template<typename T>
@@ -161,7 +162,7 @@ struct task_promise_type
 
     // also we can await other task<T>
     template<typename U>
-    auto await_transform(task<U>& task)
+    auto await_transform(const task<U>& task)
     {
         if (!task.handle) {
             throw std::runtime_error("coroutine without promise awaited");
@@ -212,8 +213,7 @@ struct task_promise_type
     {
         struct event_awaitable
         {
-            int fd;
-            short what;
+            awaitable_event aev;
             event* ev;
             std::coroutine_handle<> handle;
 
@@ -222,7 +222,7 @@ struct task_promise_type
                 event_awaitable* eva = (event_awaitable*)arg;
 
                 trace("resume", arg);
-                eva->what = what;
+                eva->aev.what = what;
                 eva->handle.resume();
             }
 
@@ -233,24 +233,31 @@ struct task_promise_type
 
             void await_suspend(std::coroutine_handle<> h)
             {
-                trace("awaiting event", what & EV_READ ? "read" : "", what & EV_WRITE ? "write" : "");
+                trace("awaiting event", aev.what & EV_READ ? "read" : "", aev.what & EV_WRITE ? "write" : "");
 
                 this->handle = h;
-                this->ev = event_new(g_event_loop, fd, what | EV_TIMEOUT, event_awaitable::resume_on_event, this);
+                this->ev = event_new(g_event_loop, aev.fd, aev.what | EV_TIMEOUT, event_awaitable::resume_on_event, this);
 
-                timeval timeout{3, 0};
-                event_add(this->ev, &timeout);
+                if (aev.timeout != 0)
+                {
+                    timeval tv{aev.timeout, 0};
+                    event_add(this->ev, &tv);
+                }
+                else
+                {
+                    event_add(this->ev, nullptr);
+                }
             }
 
             // when ready return value to a consumer
             bool await_resume()
             {
                 event_free(this->ev);
-                return (what & EV_TIMEOUT) == 0;
+                return (aev.what & EV_TIMEOUT) == 0;
             }
         };
 
-        return event_awaitable{ev.fd, ev.what};
+        return event_awaitable{ev};
     }
 };
 
@@ -340,7 +347,7 @@ using namespace std::chrono_literals;
 
 task<int> async_accept(int fd)
 {
-    if (co_await awaitable_event{fd, EV_READ})
+    if (co_await awaitable_event{fd, EV_READ, 3})
     {
         int newfd = accept(fd, nullptr, nullptr);
 
@@ -350,6 +357,36 @@ task<int> async_accept(int fd)
 
     trace("timeout return");
     co_return -1;
+}
+
+task<int> async_read(int fd, char* buf, size_t bufsz)
+{
+    if (co_await awaitable_event{fd, EV_READ, 0})
+    {
+        trace("read ready");
+        co_return read(fd, buf, bufsz);
+    }
+
+    co_return -1;
+}
+
+task<int> async_echo_client(int fd)
+{
+    trace("echo client started", fd);
+    while (true)
+    {
+        char buf[512];
+        int n = co_await async_read(fd, buf, sizeof(buf));
+
+        if (n == 0)
+        {
+            break;
+        }
+
+        send(fd, buf, n, 0);
+    }
+
+    co_return 0;
 }
 
 task<int> wait_n(int n)
@@ -413,11 +450,20 @@ task<int> start_server()
 
     getsockname(fd, (sockaddr *)&sin, &sinsz);
 
+    trace("server bound to", ntohs(sin.sin_port));
+
+    std::vector<task<int>> v;
+
     while (true)
     {
-        auto aa = async_accept(fd);
-        int cfd = co_await aa;
-        trace("after await", cfd);
+        int cfd = co_await async_accept(fd);
+
+        if (cfd != -1)
+        {
+            trace("accepted client", cfd);
+
+            v.emplace_back(async_echo_client(cfd));
+        }
     }
 
     co_return EXIT_SUCCESS;
